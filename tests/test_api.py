@@ -35,16 +35,26 @@ def test_api_normal_duplicate_and_distinguishable_errors():
     over = client.post("/payments", json={
         "request_id": "over", "amount_cents": TOTAL + 1,
         "pay_date": "2026-02-01"})
+    over_due = client.post("/payments", json={
+        "request_id": "over-due", "amount_cents": e1 + 1,
+        "pay_date": "2026-02-01"})
     print("[判定依据] 非法金额 ->", bad.status_code, bad.json()["error"])
-    print("[判定依据] 超额还款 ->", over.status_code, over.json()["error"])
+    print("[判定依据] 超全部应还 ->", over.status_code, over.json()["error"])
+    print("[判定依据] 超当期到期应还 ->", over_due.status_code,
+          over_due.json()["error"])
     assert bad.status_code == 400
     assert over.status_code == 422
+    assert over.json()["error"] == "ExcessPaymentError"
+    assert over_due.status_code == 422
+    assert over_due.json()["error"] == "ExceedsDueAmountError"
 
-    # 结清后再入账 -> 409
-    remain = sum(e.total_cents for e in main.account.schedule[1:])
-    client.post("/payments", json={
-        "request_id": "settle", "amount_cents": remain,
-        "pay_date": "2026-02-01"})
+    # 提前还款走独立入口：还完全部剩余本金后账户结清，再入账 -> 409
+    remaining = main.account.balances()["principal"]
+    pp = client.post("/prepayments", json={
+        "request_id": "pp-1", "amount_cents": remaining,
+        "apply_date": "2026-02-01", "mode": "reduce_term"})
+    print("[中间状态] 提前结清回执:", pp.json())
+    assert pp.status_code == 200
     again = client.post("/payments", json={
         "request_id": "again", "amount_cents": 1, "pay_date": "2026-02-01"})
     print("[判定依据] 已结清 ->", again.status_code, again.json()["error"])

@@ -13,6 +13,10 @@ class ExcessPaymentError(LoanLedgerError):
     """还款金额超出当前应还范围。"""
 
 
+class ExceedsDueAmountError(LoanLedgerError):
+    """普通还款金额超过当前到期应还（提前还款须走单独申请）。"""
+
+
 class AccountSettledError(LoanLedgerError):
     """账户已结清，拒绝再次入账。"""
 

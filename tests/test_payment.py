@@ -12,6 +12,7 @@ from loan_ledger import (
     InvalidAmountError,
     LoanAccount,
     LoanConfig,
+    PrepaymentMode,
     RepaymentMethod,
 )
 
@@ -50,16 +51,16 @@ def test_full_first_period_then_prepayment_recalc():
     acc.post_payment("p1", e1.total_cents, date(2026, 2, 1))
     before = [e.total_cents for e in acc.schedule[1:]]
     prepay = 20_000_000  # 提前还 20 万元本金
-    r = acc.post_payment("p2", prepay, date(2026, 2, 5))
-    print("\n[输入] 提前还款(分):", prepay)
-    print("[中间状态] 分配:", r.allocation)
-    assert r.allocation.principal_cents == prepay  # 全部冲本金
+    r = acc.apply_prepayment("pp-1", prepay, date(2026, 2, 5),
+                             PrepaymentMode.REDUCE_INSTALLMENT)
+    print("\n[输入] 提前还款(分):", prepay, "方式: 期数不变降低月供")
+    print("[中间状态] 回执:", r)
+    assert r.principal_before_cents - r.principal_after_cents == prepay
+    assert r.periods_after == r.periods_before  # 期数不变
     after = [e.total_cents for e in acc.schedule[1:]]
-    # 提前还款先整额冲掉第 2、3 期本金并部分冲第 4 期，
-    # 因此重算体现在“完全未还”的第 5 期及以后
-    print("[中间状态] 重算前第5期月供:", before[3], "重算后:", after[3])
-    print("[判定依据] 重算后月供应下降:", after[3] < before[3])
-    assert after[3] < before[3]
+    print("[中间状态] 重算前第2期月供:", before[0], "重算后:", after[0])
+    print("[判定依据] 重算后月供应下降:", after[0] < before[0])
+    assert after[0] < before[0]
     # 守恒：所有期次未还本金合计 == 账户剩余本金
     b = acc.balances()
     unpaid = sum(e.principal_cents - e.paid_principal_cents
@@ -142,14 +143,22 @@ def test_concurrent_distinct_requests_no_overcharge():
 
 def test_settled_account_rejects_payment():
     acc = make_account()
-    total = sum(e.total_cents for e in acc.schedule)
-    r = acc.post_payment("all", total, date(2026, 2, 1))
-    print("\n[输入] 一次性结清全部:", total, "随后再还 1 分")
-    print("[中间状态] 结清后状态:", acc.status, "回执状态:", r.status_after)
+    # 先还首期到期应还，再申请提前还完全部剩余本金（提前结清）
+    e1 = acc.schedule[0]
+    acc.post_payment("p1", e1.total_cents, date(2026, 2, 1))
+    remaining = acc.balances()["principal"]
+    r = acc.apply_prepayment("settle", remaining, date(2026, 2, 1),
+                             PrepaymentMode.REDUCE_TERM)
+    print("\n[输入] 还首期后提前还完全部剩余本金:", remaining,
+          "随后再还 1 分")
+    print("[中间状态] 结清后状态:", acc.status, "剩余期数:", r.periods_after)
     assert acc.status is AccountStatus.SETTLED
     with pytest.raises(AccountSettledError):
         acc.post_payment("again", 1, date(2026, 2, 2))
-    print("[判定依据] 已结清账户再次入账抛出 AccountSettledError")
+    with pytest.raises(AccountSettledError):
+        acc.apply_prepayment("again-pp", 1, date(2026, 2, 2),
+                             PrepaymentMode.REDUCE_TERM)
+    print("[判定依据] 已结清账户普通还款/提前还款均抛出 AccountSettledError")
 
 
 def test_invalid_amount_and_excess_payment():

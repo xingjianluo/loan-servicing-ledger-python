@@ -18,7 +18,7 @@ loan_ledger/
   errors.py    # 可区分的失败原因（见“错误类型”）
   models.py    # 领域模型：LoanConfig / ScheduleEntry / Allocation / 回执 / 状态变更
   schedule.py  # 等额本息、等额本金摊还计划生成与重算
-  account.py   # 还款入账、幂等、罚息计提、逾期与状态迁移
+  account.py   # 还款入账、提前还款申请、幂等、罚息计提、逾期与状态迁移
 tests/         # pytest 用例（摊还守恒 / 部分还款 / 幂等并发 / 逾期 / API）
 main.py        # FastAPI 本地接口
 ```
@@ -42,30 +42,49 @@ main.py        # FastAPI 本地接口
 - **期间利率调整**：仅重算“未到期且完全未还”的期次；已部分还款的当期
   保持原金额（历史已发生的债权债务不追溯修改）。重算后未来期本金合计
   不变，利息随利率变化。
-- **提前还款**：超过当前已到期应还的资金视为提前还款，采用**余额法**——
-  直接冲减剩余本金余额，未来各期按原期数、原到期日重新摊还（月供下降）。
-  若资金足以覆盖全部剩余本金与利息，则按 FIFO 完成提前结清。
+- **提前还款**：必须走独立申请入口（`apply_prepayment` / `POST
+  /prepayments`），普通还款不再自动转提前还款。申请时二选一：
+  - `REDUCE_TERM`（缩短期限）：月供保持不变，剩余期数缩短。重算后各期
+    到期日从首个重算期起逐月连续推进，期号连续，无空期、无重复期；
+    末期应还不超过月供（兜底吸收尾差）。
+  - `REDUCE_INSTALLMENT`（降低月供）：期数与到期日不变，月供下降。
+  - 两种方式都直接把申请金额冲减当前真实剩余本金，并对“未到期且
+    完全未还”的期次重摊：每期 本金+利息=当期应还总额，各期本金合计
+    严格等于剩余本金，尾差归入末期，不留对不上的零头。
+  - 提前还款可反复申请，每次都按当时的真实剩余本金重新计算。
+  - 申请金额足以覆盖全部未来本金时，未来期次整段删除（提前结清，
+    未发生的未来利息不再计收）。
+- **与调息叠加的语义**：重算按**逐期利率**进行——每一期已生效的适用
+  利率（无论是初始利率还是调息后的利率）在提前还款重算中原样保留，
+  不会回退到调息前的老利率。“先调息再提前还”与“先提前还再调息”
+  任意穿插、提前还款做几次，最终剩余本金、各期金额与利息合计均守恒，
+  且未来期利率始终等于最近一次已生效的调息结果。
 - 重算作用域之外期次的未还本金不参与分摊，因此重算后
   “各期未还本金合计 = 账户剩余本金”恒成立。
 
 ## 还款分配规则
 
-入账资金按以下**固定优先级**依次分配（稳定、可预测）：
+普通还款入账资金按以下**固定优先级**依次分配（稳定、可预测）：
 
 1. **罚息**
 2. **费用**
 3. **已到期利息**（到期日 ≤ 还款日，按期号 FIFO）
 4. **已到期本金**（同上，按期号 FIFO）
-5. **提前还本金**（见上文“余额法”；提前结清时再冲未到期利息）
 
 分配恒等式：`罚息 + 费用 + 利息 + 本金 = 还款金额`。支持任意金额的部分还款。
+普通还款金额**超过当前到期应还即拒绝**（`ExceedsDueAmountError`），
+不会自动转成提前还款；想提前还本金请使用提前还款申请入口。
 
 ## 幂等与并发
 
 - 每笔还款必须携带非空 `request_id`；同一 `request_id` 的重复提交直接
   返回**首次回执**（回执标记 `duplicate=true`），账户余额不重复扣减。
+- 提前还款申请同样按 `request_id` 幂等（与普通还款各自独立编号）：
+  同一申请单号重复或并发提交只入账一次，余额与期次不重复扣减，
+  重放返回首次回执（`duplicate=true`）。
 - 账户内部使用线程锁串行化写入；并发提交相同 `request_id` 时仅首笔真正
-  入账，其余全部幂等重放；并发不同请求串行执行，入账总额不重不漏。
+  入账，其余全部幂等重放；普通还款与提前还款混合并发时串行执行，
+  入账总额不重不漏。
 
 ## 逾期判定与状态迁移
 
@@ -96,9 +115,10 @@ main.py        # FastAPI 本地接口
 | 异常 | HTTP 状态码 | 触发场景 |
 | --- | --- | --- |
 | `InvalidAmountError` | 400 | 金额为 0、负数或非整数 |
-| `InvalidRequestError` | 400 | `request_id` 为空、利率为负、本金/期数非法 |
-| `ExcessPaymentError` | 422 | 还款金额超出当前全部应还（本金+利息+罚息+费用） |
-| `AccountSettledError` | 409 | 已结清账户再次入账 |
+| `InvalidRequestError` | 400 | `request_id` 为空、利率为负、本金/期数非法、提前还款方式非法 |
+| `ExceedsDueAmountError` | 422 | 普通还款金额超过当前到期应还（提前还款须走单独申请） |
+| `ExcessPaymentError` | 422 | 还款金额超出当前全部应还，或提前还款金额超出剩余本金 |
+| `AccountSettledError` | 409 | 已结清账户再次入账或申请提前还款 |
 
 ## 本地 HTTP API（main.py）
 
@@ -107,7 +127,8 @@ main.py        # FastAPI 本地接口
 | `GET /schedule` | 当前摊还计划（含每期已还/状态） |
 | `GET /balances` | 各科目未还余额（penalty/fee/interest/principal） |
 | `GET /status?as_of=YYYY-MM-DD` | 推进到指定日期的逾期判定与状态迁移历史 |
-| `POST /payments` | `{request_id, amount_cents, pay_date}` 还款入账 |
+| `POST /payments` | `{request_id, amount_cents, pay_date}` 普通还款入账（超当期到期应还即拒绝） |
+| `POST /prepayments` | `{request_id, amount_cents, apply_date, mode}` 提前还款申请，`mode` 为 `reduce_term` / `reduce_installment` |
 | `POST /rate-adjustments` | `{new_annual_rate, effective_date}` 利率调整 |
 | `POST /fees` | `{amount_cents}` 计收一笔费用 |
 
@@ -119,6 +140,13 @@ curl -X POST localhost:8000/payments -H 'Content-Type: application/json' \
 curl -X POST localhost:8000/payments -H 'Content-Type: application/json' \
   -d '{"request_id":"demo-1","amount_cents":8496726,"pay_date":"2026-02-01"}'
 # 第二次返回 duplicate=true，余额不变
+
+# 提前还款申请（月供不变、缩短期数）
+curl -X POST localhost:8000/prepayments -H 'Content-Type: application/json' \
+  -d '{"request_id":"pp-1","amount_cents":20000000,"apply_date":"2026-02-05","mode":"reduce_term"}'
+# 提前还款申请（期数不变、降低月供）
+curl -X POST localhost:8000/prepayments -H 'Content-Type: application/json' \
+  -d '{"request_id":"pp-2","amount_cents":10000000,"apply_date":"2026-03-05","mode":"reduce_installment"}'
 ```
 
 ## 测试覆盖
@@ -126,10 +154,15 @@ curl -X POST localhost:8000/payments -H 'Content-Type: application/json' \
 `uv run pytest -s`（用例会打印输入、关键中间状态与判定依据）：
 
 - 两种口径的摊还守恒、尾差归属、零利率、重算守恒；
-- 部分还款、提前还款重算、利率调整后重算；
-- 同一 `request_id` 重复提交与 16 线程并发提交的幂等；
-- 8 线程并发不同请求不重不漏；
+- 部分还款、利率调整后重算；
+- 提前还款两种方式（缩短期限月供不变 / 期数不变月供下降）、
+  到期日与期号连续无空期、反复提前还款按当时真实剩余本金重算；
+- “先调息再提前还”与“先提前还再调息”两种顺序下已生效利率不回退、
+  账目守恒；
+- 普通还款超当期到期应还直接拒绝（不自动转提前还款），
+  非法金额 / 超当期到期应还 / 超全部应还 / 已结清四类拒绝可区分；
+- 同一 `request_id` 重复提交与多线程并发提交的幂等（普通还款与
+  提前还款混合并发不重不漏）；
 - 跨宽限期逾期、罚息逐天计提、还款后罚息基数下降、逾期后恢复正常、
   罚息→费用→利息→本金的分配顺序；
-- 非法金额、超额还款、结清后入账的可区分拒绝；
 - HTTP 层 400 / 409 / 422 状态码与错误类型。

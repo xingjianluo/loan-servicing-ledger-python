@@ -1,11 +1,13 @@
-"""贷款账户：还款入账、幂等、逾期判定与状态迁移。
+"""贷款账户：还款入账、提前还款申请、幂等、逾期判定与状态迁移。
 
-还款分配优先级（稳定且明确）：
-罚息 -> 费用 -> 已到期利息 -> 已到期本金 -> 提前还本金（未到期期次）；
-同一科目内部按期号从小到大（FIFO）分配。
+普通还款分配优先级（稳定且明确）：
+罚息 -> 费用 -> 已到期利息 -> 已到期本金；同一科目内部按期号 FIFO。
+普通还款金额超过“当前到期应还”即拒绝（ExceedsDueAmountError），
+不会自动转成提前还款；提前还款必须走独立申请入口 apply_prepayment。
 
-提前还款：还款覆盖了所有已到期金额后，多余本金会提前冲减未来期次本金，
-随后对“完全未还的未来期次”按剩余本金与剩余期数重算（利率不变）。
+提前还款申请：直接冲减剩余本金，并按用户选择重摊未来期次——
+REDUCE_TERM（月供不变、缩短期数）或 REDUCE_INSTALLMENT（期数不变、
+降低月供）。重算逐期保住已生效的调息结果（适用利率不回退）。
 利率调整：仅作用于完全未还的未来期次，当期已部分还款的期次保持原金额。
 """
 
@@ -16,6 +18,7 @@ from datetime import date, timedelta
 
 from .errors import (
     AccountSettledError,
+    ExceedsDueAmountError,
     ExcessPaymentError,
     InvalidAmountError,
     InvalidRequestError,
@@ -26,10 +29,18 @@ from .models import (
     EntryStatus,
     LoanConfig,
     PaymentReceipt,
+    PrepaymentMode,
+    PrepaymentReceipt,
+    RepaymentMethod,
     ScheduleEntry,
     StatusChange,
 )
-from .schedule import generate_schedule, recalc_schedule
+from .schedule import (
+    generate_schedule,
+    rebuild_with_rates,
+    recalc_schedule,
+    shortened_schedule,
+)
 
 
 class LoanAccount:
@@ -46,6 +57,7 @@ class LoanAccount:
         )
         self.status_history: list[StatusChange] = []
         self._receipts: dict[str, PaymentReceipt] = {}
+        self._prepay_receipts: dict[str, PrepaymentReceipt] = {}
         self._lock = threading.Lock()
         # 罚息与费用科目（分）
         self._penalty_accrued = 0
@@ -134,6 +146,20 @@ class LoanAccount:
             + sum(self._entry_unpaid_total(e) for e in self.schedule)
         )
 
+    def _due_amount(self, as_of: date) -> int:
+        """当前到期应还：罚息 + 费用 + 到期日 <= as_of 期次的未还金额。"""
+        return (
+            (self._penalty_accrued - self._penalty_paid)
+            + (self._fee_charged - self._fee_paid)
+            + sum(self._entry_unpaid_total(e) for e in self.schedule
+                  if e.due_date <= as_of)
+        )
+
+    def _remaining_principal(self) -> int:
+        """真实剩余本金：各期未还本金合计。"""
+        return sum(e.principal_cents - e.paid_principal_cents
+                   for e in self.schedule)
+
     # ---------- 对外：费用 ----------
 
     def charge_fee(self, amount_cents: int) -> None:
@@ -174,7 +200,12 @@ class LoanAccount:
             outstanding = self._outstanding()
             if amount_cents > outstanding:
                 raise ExcessPaymentError(
-                    f"还款金额 {amount_cents} 超出当前应还 {outstanding}")
+                    f"还款金额 {amount_cents} 超出当前全部应还 {outstanding}")
+            due = self._due_amount(pay_date)
+            if amount_cents > due:
+                raise ExceedsDueAmountError(
+                    f"还款金额 {amount_cents} 超过当前到期应还 {due}，"
+                    f"提前还款请使用提前还款申请入口")
 
             allocation = self._allocate(amount_cents, pay_date)
             receipt = PaymentReceipt(
@@ -193,13 +224,10 @@ class LoanAccount:
             return receipt
 
     def _allocate(self, amount_cents: int, pay_date: date) -> Allocation:
-        """分配顺序：罚息 -> 费用 -> 已到期利息 -> 已到期本金 -> 提前还本金。
+        """分配顺序：罚息 -> 费用 -> 已到期利息 -> 已到期本金。
 
-        利息/本金先分配到“已到期”（到期日 <= 还款日）的期次，期号升序；
-        超出已到期应还的部分视为提前还款，采用“余额法”：
-        直接冲减剩余本金余额，并把未到期、完全未还的期次重新摊还
-        （减少月供，期数与到期日不变）。若提前还款额足以覆盖全部剩余
-        本金（相当于提前结清），则 FIFO 逐期冲本金、再冲利息。
+        普通还款只允许覆盖“当前到期应还”（入口已校验），
+        因此分配结束时剩余金额必为 0；提前还款不走这里。
         """
         alloc = Allocation()
         remaining = amount_cents
@@ -240,9 +268,8 @@ class LoanAccount:
             alloc.principal_cents += pay
             remaining -= pay
 
-        # 5. 提前还款（余额法重摊，或 FIFO 兜底完成提前结清）
-        if remaining > 0:
-            self._apply_prepayment(remaining, pay_date, alloc)
+        assert remaining == 0, \
+            f"普通还款不应有超出到期应还的余额: {remaining}"
         assert alloc.total_cents == amount_cents, \
             f"分配守恒被破坏: {alloc.total_cents} != {amount_cents}"
         return alloc
@@ -254,37 +281,6 @@ class LoanAccount:
                 and self._entry_unpaid_total(e) > 0
                 and e.paid_principal_cents == 0
                 and e.paid_interest_cents == 0]
-
-    def _apply_prepayment(self, pool: int, pay_date: date,
-                          alloc: Allocation) -> None:
-        """处理超出已到期应还的资金：余额法冲本金并重摊；否则 FIFO 结清。"""
-        target_idx = self._target_indices(pay_date)
-        target_unpaid = sum(
-            self.schedule[i].principal_cents for i in target_idx)
-        if target_idx and pool < target_unpaid:
-            # 余额法：pool 全部冲减本金，剩余余额在同样期数上重摊
-            self._recalc(target_idx, target_unpaid - pool)
-            alloc.principal_cents += pool
-            return
-        # FIFO 兜底：按期号先冲所有未还本金，再冲未还利息（提前结清路径）
-        rest = pool
-        for e in self.schedule:
-            if rest <= 0:
-                break
-            due = e.principal_cents - e.paid_principal_cents
-            pay = min(due, rest)
-            e.paid_principal_cents += pay
-            alloc.principal_cents += pay
-            rest -= pay
-        for e in self.schedule:
-            if rest <= 0:
-                break
-            due = e.interest_cents - e.paid_interest_cents
-            pay = min(due, rest)
-            e.paid_interest_cents += pay
-            alloc.interest_cents += pay
-            rest -= pay
-        assert rest == 0, "提前结清分配后不应有剩余"
 
     # ---------- 对外：重算 ----------
 
@@ -322,6 +318,122 @@ class LoanAccount:
         with self._lock:
             self._accrue_penalty(effective_date)
             self._recalc_future(effective_date, new_rate=new_annual_rate)
+
+    # ---------- 对外：提前还款申请 ----------
+
+    def apply_prepayment(self, request_id: str, amount_cents: int,
+                         apply_date: date,
+                         mode: PrepaymentMode) -> PrepaymentReceipt:
+        """提前还款申请（独立入口，幂等）。
+
+        直接冲减当前真实剩余本金，并按 mode 重摊“未到期且完全未还”的期次：
+        - REDUCE_TERM：月供不变、缩短期数，到期日逐月连续、不留空期；
+        - REDUCE_INSTALLMENT：期数与到期日不变、降低月供。
+        重算逐期沿用各期原适用利率，已生效的调息结果不会回退。
+        同一 request_id 重复/并发提交只入账一次，重放首次回执。
+        """
+        if not request_id:
+            raise InvalidRequestError("request_id 不能为空")
+        try:
+            mode = PrepaymentMode(mode)
+        except ValueError:
+            raise InvalidRequestError(f"非法的提前还款方式: {mode}") from None
+        with self._lock:
+            # 幂等：重复或并发提交直接重放首次结果，余额与期次不重复扣减
+            if request_id in self._prepay_receipts:
+                first = self._prepay_receipts[request_id]
+                return PrepaymentReceipt(
+                    request_id=first.request_id,
+                    amount_cents=first.amount_cents,
+                    mode=first.mode,
+                    principal_before_cents=first.principal_before_cents,
+                    principal_after_cents=first.principal_after_cents,
+                    periods_before=first.periods_before,
+                    periods_after=first.periods_after,
+                    duplicate=True,
+                )
+            if not isinstance(amount_cents, int) or amount_cents <= 0:
+                raise InvalidAmountError("提前还款金额必须为正整数分")
+
+            self._accrue_penalty(apply_date)
+            self._refresh_entries(apply_date)
+            if self._is_settled():
+                self._set_status(AccountStatus.SETTLED, apply_date,
+                                 "全部应还已结清")
+                raise AccountSettledError("账户已结清，拒绝提前还款申请")
+
+            principal_before = self._remaining_principal()
+            if amount_cents > principal_before:
+                raise ExcessPaymentError(
+                    f"提前还款金额 {amount_cents} 超出剩余本金 "
+                    f"{principal_before}")
+            periods_before = sum(
+                1 for e in self.schedule if self._entry_unpaid_total(e) > 0)
+
+            self._apply_prepay_principal(amount_cents, apply_date, mode)
+
+            self._refresh_entries(apply_date)
+            if self._is_settled():
+                self._set_status(AccountStatus.SETTLED, apply_date,
+                                 "全部应还已结清")
+            receipt = PrepaymentReceipt(
+                request_id=request_id,
+                amount_cents=amount_cents,
+                mode=mode,
+                principal_before_cents=principal_before,
+                principal_after_cents=self._remaining_principal(),
+                periods_before=periods_before,
+                periods_after=sum(1 for e in self.schedule
+                                  if self._entry_unpaid_total(e) > 0),
+            )
+            self._prepay_receipts[request_id] = receipt
+            return receipt
+
+    def _apply_prepay_principal(self, amount_cents: int, apply_date: date,
+                                mode: PrepaymentMode) -> None:
+        """冲减本金并重摊未来期次（逐期保住原适用利率）。"""
+        target_idx = self._target_indices(apply_date)
+        target_principal = sum(
+            self.schedule[i].principal_cents for i in target_idx)
+        rest = amount_cents
+        if target_idx:
+            # 重算作用域必为计划表后缀（未来期次不可能被部分还款）
+            assert target_idx == list(range(target_idx[0],
+                                            len(self.schedule)))
+            first = self.schedule[target_idx[0]]
+            if rest >= target_principal:
+                # 未来期次本金被全部冲掉：整段删除
+                del self.schedule[target_idx[0]:]
+                rest -= target_principal
+            else:
+                rates = [self.schedule[i].rate for i in target_idx]
+                new_base = target_principal - rest
+                if mode is PrepaymentMode.REDUCE_INSTALLMENT:
+                    rebuilt = rebuild_with_rates(
+                        new_base, rates, self.config.method,
+                        first_due_date=first.due_date,
+                        start_period=first.period)
+                else:  # REDUCE_TERM：月供/每期本金基数不变，期数缩短
+                    keep = (first.total_cents if self.config.method
+                            is RepaymentMethod.EQUAL_INSTALLMENT
+                            else first.principal_cents)
+                    rebuilt = shortened_schedule(
+                        new_base, rates, self.config.method,
+                        first_due_date=first.due_date,
+                        start_period=first.period,
+                        keep_cents=keep)
+                self.schedule[target_idx[0]:] = rebuilt
+                rest = 0
+        # 兜底：剩余部分冲减已到期/逾期期次的未还本金（期号从大到小）
+        if rest > 0:
+            for e in reversed(self.schedule):
+                if rest <= 0:
+                    break
+                unpaid = e.principal_cents - e.paid_principal_cents
+                cut = min(unpaid, rest)
+                e.principal_cents -= cut
+                rest -= cut
+        assert rest == 0, "提前还款本金冲减后不应有剩余"
 
     # ---------- 对外：查询 ----------
 

@@ -1,6 +1,7 @@
 from .account import LoanAccount
 from .errors import (
     AccountSettledError,
+    ExceedsDueAmountError,
     ExcessPaymentError,
     InvalidAmountError,
     InvalidRequestError,
@@ -12,6 +13,8 @@ from .models import (
     EntryStatus,
     LoanConfig,
     PaymentReceipt,
+    PrepaymentMode,
+    PrepaymentReceipt,
     RepaymentMethod,
     ScheduleEntry,
     StatusChange,
@@ -23,6 +26,7 @@ __all__ = [
     "LoanLedgerError",
     "InvalidAmountError",
     "ExcessPaymentError",
+    "ExceedsDueAmountError",
     "AccountSettledError",
     "InvalidRequestError",
     "AccountStatus",
@@ -30,6 +34,8 @@ __all__ = [
     "EntryStatus",
     "LoanConfig",
     "PaymentReceipt",
+    "PrepaymentMode",
+    "PrepaymentReceipt",
     "RepaymentMethod",
     "ScheduleEntry",
     "StatusChange",

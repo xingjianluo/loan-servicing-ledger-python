@@ -18,6 +18,11 @@ class AccountStatus(str, Enum):
     SETTLED = "settled"      # 已结清
 
 
+class PrepaymentMode(str, Enum):
+    REDUCE_TERM = "reduce_term"                # 月供不变，缩短期数
+    REDUCE_INSTALLMENT = "reduce_installment"  # 期数不变，降低月供
+
+
 class EntryStatus(str, Enum):
     PENDING = "pending"      # 未到期
     DUE = "due"              # 已到期未足额
@@ -68,6 +73,20 @@ class PaymentReceipt:
     allocation: Allocation
     status_after: AccountStatus
     duplicate: bool = False  # 是否为幂等重放
+
+
+@dataclass
+class PrepaymentReceipt:
+    """提前还款申请回执。"""
+
+    request_id: str
+    amount_cents: int
+    mode: PrepaymentMode
+    principal_before_cents: int   # 申请前剩余本金
+    principal_after_cents: int    # 申请后剩余本金
+    periods_before: int           # 申请前剩余期数（未结清期次）
+    periods_after: int            # 申请后剩余期数
+    duplicate: bool = False       # 是否为幂等重放
 
 
 @dataclass

@@ -11,11 +11,13 @@ from pydantic import BaseModel, Field
 
 from loan_ledger import (
     AccountSettledError,
+    ExceedsDueAmountError,
     ExcessPaymentError,
     InvalidAmountError,
     InvalidRequestError,
     LoanAccount,
     LoanConfig,
+    PrepaymentMode,
     RepaymentMethod,
 )
 
@@ -43,6 +45,13 @@ class RateAdjustIn(BaseModel):
     effective_date: date
 
 
+class PrepaymentIn(BaseModel):
+    request_id: str = Field(min_length=1)
+    amount_cents: int
+    apply_date: date
+    mode: PrepaymentMode
+
+
 class FeeIn(BaseModel):
     amount_cents: int
 
@@ -54,6 +63,11 @@ async def _invalid_amount(_, exc):
 
 @app.exception_handler(ExcessPaymentError)
 async def _excess(_, exc):
+    return _err(422, exc)
+
+
+@app.exception_handler(ExceedsDueAmountError)
+async def _exceeds_due(_, exc):
     return _err(422, exc)
 
 
@@ -95,6 +109,12 @@ def post_payment(body: PaymentIn):
     r = account.post_payment(body.request_id, body.amount_cents,
                              body.pay_date)
     return r
+
+
+@app.post("/prepayments")
+def apply_prepayment(body: PrepaymentIn):
+    return account.apply_prepayment(body.request_id, body.amount_cents,
+                                    body.apply_date, body.mode)
 
 
 @app.post("/rate-adjustments")
