@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 
@@ -24,6 +24,19 @@ class EntryStatus(str, Enum):
     GRACE = "grace"          # 宽限期内
     OVERDUE = "overdue"      # 已过宽限期
     PAID = "paid"            # 已足额结清
+
+
+class PrepaymentMethod(str, Enum):
+    SHORTEN_TERM = "shorten_term"    # 月供不变，缩短剩余期数
+    REDUCE_PAYMENT = "reduce_payment"  # 期数不变，降低月供
+
+
+@dataclass
+class RateChange:
+    """利率调整记录：自 effective_date 起（含当日生效的未来期次）适用新利率。"""
+
+    effective_date: date
+    annual_rate: float
 
 
 @dataclass
@@ -68,6 +81,20 @@ class PaymentReceipt:
     allocation: Allocation
     status_after: AccountStatus
     duplicate: bool = False  # 是否为幂等重放
+
+
+@dataclass
+class PrepaymentReceipt:
+    """提前还款申请回执（独立入口，与普通还款分开）。"""
+
+    request_id: str
+    amount_cents: int                 # 本次提前偿还的本金（分）
+    method: PrepaymentMethod
+    remaining_principal_cents: int    # 申请后剩余本金（分）
+    remaining_periods: int            # 申请后完全未还的剩余期数
+    next_due_date: date | None        # 重算后首个未到期期次的到期日
+    status_after: AccountStatus
+    duplicate: bool = False          # 是否为幂等重放
 
 
 @dataclass

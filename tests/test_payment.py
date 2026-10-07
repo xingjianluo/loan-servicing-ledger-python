@@ -8,10 +8,12 @@ import pytest
 from loan_ledger import (
     AccountSettledError,
     AccountStatus,
-    ExcessPaymentError,
     InvalidAmountError,
     LoanAccount,
     LoanConfig,
+    PaymentExceedsDueError,
+    PaymentExceedsTotalError,
+    PrepaymentMethod,
     RepaymentMethod,
 )
 
@@ -48,25 +50,32 @@ def test_full_first_period_then_prepayment_recalc():
     acc = make_account()
     e1 = acc.schedule[0]
     acc.post_payment("p1", e1.total_cents, date(2026, 2, 1))
-    before = [e.total_cents for e in acc.schedule[1:]]
+    before_payment = acc.schedule[1].total_cents
     prepay = 20_000_000  # 提前还 20 万元本金
-    r = acc.post_payment("p2", prepay, date(2026, 2, 5))
-    print("\n[输入] 提前还款(分):", prepay)
-    print("[中间状态] 分配:", r.allocation)
-    assert r.allocation.principal_cents == prepay  # 全部冲本金
-    after = [e.total_cents for e in acc.schedule[1:]]
-    # 提前还款先整额冲掉第 2、3 期本金并部分冲第 4 期，
-    # 因此重算体现在“完全未还”的第 5 期及以后
-    print("[中间状态] 重算前第5期月供:", before[3], "重算后:", after[3])
-    print("[判定依据] 重算后月供应下降:", after[3] < before[3])
-    assert after[3] < before[3]
-    # 守恒：所有期次未还本金合计 == 账户剩余本金
+    r = acc.apply_prepayment(
+        "pp-1", prepay, PrepaymentMethod.REDUCE_PAYMENT,
+        date(2026, 2, 5))
+    print("\n[输入] 提前还款(分):", prepay, "方式: REDUCE_PAYMENT")
+    print("[中间状态] 回执:", r)
+    assert r.amount_cents == prepay
+    # 余额法：期数与到期日不变，整个作用域按减少后的本金重摊，月供下降
+    after_payment = acc.schedule[1].total_cents
+    print("[中间状态] 重算前月供:", before_payment, "重算后:", after_payment)
+    print("[判定依据] 重算后月供应下降:", after_payment < before_payment)
+    assert after_payment < before_payment
+    # 守恒：计划表本金合计 = 原始本金 - 提前还款额；未还本金另扣首期已还
+    assert sum(e.principal_cents for e in acc.schedule) \
+        == 1_000_000_00 - prepay
     b = acc.balances()
+    assert b["principal"] == 1_000_000_00 - e1.principal_cents - prepay
     unpaid = sum(e.principal_cents - e.paid_principal_cents
                  for e in acc.schedule)
     print("[判定依据] 各期未还本金合计:", unpaid, "== 账户剩余本金:",
           b["principal"])
     assert unpaid == b["principal"]
+    assert r.remaining_principal_cents == b["principal"]
+    assert r.remaining_periods == 11  # 降月供：期数不变
+    assert [e.period for e in acc.schedule[1:]] == list(range(2, 13))
 
 
 def test_duplicate_request_id_is_idempotent():
@@ -142,27 +151,45 @@ def test_concurrent_distinct_requests_no_overcharge():
 
 def test_settled_account_rejects_payment():
     acc = make_account()
-    total = sum(e.total_cents for e in acc.schedule)
-    r = acc.post_payment("all", total, date(2026, 2, 1))
-    print("\n[输入] 一次性结清全部:", total, "随后再还 1 分")
-    print("[中间状态] 结清后状态:", acc.status, "回执状态:", r.status_after)
+    # 首期走普通还款，剩余未到期本金走提前还款申请（独立入口）
+    first_total = acc.schedule[0].total_cents
+    acc.post_payment("p1", first_total, date(2026, 2, 1))
+    remaining_principal = sum(
+        e.principal_cents for e in acc.schedule
+        if e.paid_principal_cents == 0 and e.paid_interest_cents == 0)
+    r = acc.apply_prepayment(
+        "pp-all", remaining_principal,
+        PrepaymentMethod.REDUCE_PAYMENT, date(2026, 2, 2))
+    print("\n[输入] 首期普通还款", first_total, "+ 提前结清",
+          remaining_principal)
+    print("[中间状态] 提前还款回执状态:", r.status_after,
+          "剩余期数:", r.remaining_periods)
     assert acc.status is AccountStatus.SETTLED
     with pytest.raises(AccountSettledError):
-        acc.post_payment("again", 1, date(2026, 2, 2))
-    print("[判定依据] 已结清账户再次入账抛出 AccountSettledError")
+        acc.post_payment("again", 1, date(2026, 2, 3))
+    with pytest.raises(AccountSettledError):
+        acc.apply_prepayment(
+            "pp-again", 1, PrepaymentMethod.REDUCE_PAYMENT,
+            date(2026, 2, 3))
+    print("[判定依据] 已结清账户普通还款/提前还款均抛 AccountSettledError")
 
 
 def test_invalid_amount_and_excess_payment():
     acc = make_account()
-    print("\n[输入] 非法金额: 0, -100, 1.5；超额: 应还总额+1")
+    print("\n[输入] 非法金额: 0, -100, 1.5")
     for bad in (0, -100, 1.5):
         with pytest.raises(InvalidAmountError):
             acc.post_payment(f"bad-{bad}", bad, date(2026, 2, 1))
+    # 超过整笔未还总额
     total = sum(e.total_cents for e in acc.schedule)
-    with pytest.raises(ExcessPaymentError):
-        acc.post_payment("over", total + 1, date(2026, 2, 1))
-    print("[判定依据] 非法金额与超额还款分别抛出"
-          " InvalidAmountError / ExcessPaymentError，且账户未变动")
+    with pytest.raises(PaymentExceedsTotalError):
+        acc.post_payment("over-total", total + 1, date(2026, 2, 1))
+    # 超过当期到期应还（但未超整笔总额）
+    e1 = acc.schedule[0].total_cents
+    with pytest.raises(PaymentExceedsDueError):
+        acc.post_payment("over-due", e1 + 1, date(2026, 2, 1))
+    print("[判定依据] 非法金额 / 超整笔总额 / 超当期应还 三类拒绝可区分，"
+          "且账户未变动")
     assert acc.balances()["principal"] == 1_000_000_00
 
 

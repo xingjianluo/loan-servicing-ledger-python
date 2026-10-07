@@ -5,6 +5,8 @@ from .errors import (
     InvalidAmountError,
     InvalidRequestError,
     LoanLedgerError,
+    PaymentExceedsDueError,
+    PaymentExceedsTotalError,
 )
 from .models import (
     AccountStatus,
@@ -12,27 +14,42 @@ from .models import (
     EntryStatus,
     LoanConfig,
     PaymentReceipt,
+    PrepaymentMethod,
+    PrepaymentReceipt,
+    RateChange,
     RepaymentMethod,
     ScheduleEntry,
     StatusChange,
 )
-from .schedule import generate_schedule, recalc_schedule
+from .schedule import (
+    build_schedule,
+    generate_schedule,
+    recalc_schedule,
+    shorten_schedule,
+)
 
 __all__ = [
-    "LoanAccount",
-    "LoanLedgerError",
-    "InvalidAmountError",
-    "ExcessPaymentError",
     "AccountSettledError",
-    "InvalidRequestError",
     "AccountStatus",
     "Allocation",
     "EntryStatus",
+    "ExcessPaymentError",
+    "InvalidAmountError",
+    "InvalidRequestError",
+    "LoanAccount",
     "LoanConfig",
+    "LoanLedgerError",
+    "PaymentExceedsDueError",
+    "PaymentExceedsTotalError",
     "PaymentReceipt",
+    "PrepaymentMethod",
+    "PrepaymentReceipt",
+    "RateChange",
     "RepaymentMethod",
     "ScheduleEntry",
     "StatusChange",
+    "build_schedule",
     "generate_schedule",
     "recalc_schedule",
+    "shorten_schedule",
 ]

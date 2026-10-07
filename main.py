@@ -11,11 +11,13 @@ from pydantic import BaseModel, Field
 
 from loan_ledger import (
     AccountSettledError,
-    ExcessPaymentError,
     InvalidAmountError,
     InvalidRequestError,
     LoanAccount,
     LoanConfig,
+    PaymentExceedsDueError,
+    PaymentExceedsTotalError,
+    PrepaymentMethod,
     RepaymentMethod,
 )
 
@@ -38,6 +40,13 @@ class PaymentIn(BaseModel):
     pay_date: date
 
 
+class PrepaymentIn(BaseModel):
+    request_id: str = Field(min_length=1)
+    amount_cents: int
+    method: PrepaymentMethod
+    apply_date: date
+
+
 class RateAdjustIn(BaseModel):
     new_annual_rate: float = Field(ge=0)
     effective_date: date
@@ -52,8 +61,15 @@ async def _invalid_amount(_, exc):
     return _err(400, exc)
 
 
-@app.exception_handler(ExcessPaymentError)
-async def _excess(_, exc):
+@app.exception_handler(PaymentExceedsDueError)
+async def _exceeds_due(_, exc):
+    # 普通还款超过当期到期应还（不会自动转提前还款）
+    return _err(422, exc)
+
+
+@app.exception_handler(PaymentExceedsTotalError)
+async def _exceeds_total(_, exc):
+    # 超过整笔未还总额（含提前还款超过未到期剩余本金）
     return _err(422, exc)
 
 
@@ -94,6 +110,13 @@ def get_status(as_of: date):
 def post_payment(body: PaymentIn):
     r = account.post_payment(body.request_id, body.amount_cents,
                              body.pay_date)
+    return r
+
+
+@app.post("/prepayments")
+def apply_prepayment(body: PrepaymentIn):
+    r = account.apply_prepayment(
+        body.request_id, body.amount_cents, body.method, body.apply_date)
     return r
 
 

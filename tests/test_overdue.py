@@ -1,9 +1,7 @@
 """逾期判定、宽限期、罚息计提、状态迁移与费用分配测试。"""
 
 from datetime import date, timedelta
-from decimal import Decimal, ROUND_HALF_UP
-
-import pytest
+from decimal import ROUND_HALF_UP, Decimal
 
 from loan_ledger import (
     AccountStatus,
@@ -27,7 +25,7 @@ def make_account(grace_days=3, **kw) -> LoanAccount:
 
 def expected_penalty(unpaid_cents: int, days: int) -> int:
     return int((Decimal(unpaid_cents) * Decimal(str(DAILY)) * days)
-               .quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+               .quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 
 def test_grace_period_then_overdue_transition():
